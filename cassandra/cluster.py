@@ -2255,9 +2255,11 @@ class ResponseFuture(object):
         pool = self.session._pools.get(host)
         if not pool:
             self._errors[host] = ConnectionException("Host has been marked down or removed")
+            log.debug("#### _query() returning None, host %s is marked down", host)
             return None
         elif pool.is_shutdown:
             self._errors[host] = ConnectionException("Pool is shutdown")
+            log.debug("#### _query() returning None, pool %s is shutdown", host)
             return None
 
         connection = None
@@ -2319,6 +2321,7 @@ class ResponseFuture(object):
         request_id = self._query(self._current_host, prepare_message, cb=cb)
         if request_id is None:
             # try to submit the original prepared statement on some other host
+            log.debug("#### repreparing statement")
             self.send_request()
 
     def _set_result(self, response):
@@ -2455,6 +2458,7 @@ class ResponseFuture(object):
                     self._metrics.on_connection_error()
                 if not isinstance(response, ConnectionShutdown):
                     self._connection.defunct(response)
+                log.debug("### retrying on different host due to connection shutdown")
                 self._retry(reuse_connection=False, consistency_level=None)
             elif isinstance(response, Exception):
                 if hasattr(response, 'to_exception'):
@@ -2497,6 +2501,7 @@ class ResponseFuture(object):
                 request_id = self._query(self._current_host)
                 if request_id is None:
                     # this host errored out, move on to the next
+                    log.debug("#### executing after re-preparing")
                     self.send_request()
             else:
                 self._set_final_exception(ConnectionException(
@@ -2509,6 +2514,7 @@ class ResponseFuture(object):
                       self._current_host, response)
             # try again on a different host, preparing again if necessary
             self._errors[self._current_host] = response
+            log.debug("### moving on to next host after connection exception")
             self.send_request()
         else:
             self._set_final_exception(ConnectionException(
@@ -2560,8 +2566,11 @@ class ResponseFuture(object):
 
         if reuse_connection and self._query(self._current_host):
             return
+        else:
+            log.debug("### reuse connection? %s", reuse_connection)
 
         # otherwise, move onto another host
+        log.debug("### retrying on a new host")
         self.send_request()
 
     def result(self, timeout=_NOT_SET):
