@@ -356,16 +356,28 @@ class TokenAwarePolicy(LoadBalancingPolicy):
                     yield host
             else:
                 replicas = self._cluster_metadata.get_replicas(keyspace, routing_key)
+                log.info("### replicas: %s", replicas)
                 for replica in replicas:
                     if replica.is_up and \
                             child.distance(replica) == HostDistance.LOCAL:
+                        log.info("### yielding replica %s", replica)
                         yield replica
+                    elif not replica.is_up:
+                        log.info("### skipping replica %s because it's not up", replica)
+                    elif child.distance(replica) != HostDistance.LOCAL:
+                        log.info("### skipping replica %s because its distance is %s", replica, child.distance(replica))
 
                 for host in child.make_query_plan(keyspace, query):
+                    log.info("### considering host from child policy: %s", host)
                     # skip if we've already listed this host
                     if host not in replicas or \
                             child.distance(host) == HostDistance.REMOTE:
+                        log.info("### yielding non-replica: %s", host)
                         yield host
+                    elif host in replicas:
+                        log.info("### skipping %s because it's a replica", host)
+                    else:
+                        log.info("### skipping %s because its distance is %s", host, child.distance(host))
 
     def on_up(self, *args, **kwargs):
         return self._child_policy.on_up(*args, **kwargs)

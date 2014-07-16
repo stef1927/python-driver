@@ -276,8 +276,7 @@ class ConsistencyTests(unittest.TestCase):
                     self.coordinator_stats.assert_query_count_equals(self, 2, 0)
                     self.coordinator_stats.assert_query_count_equals(self, 3, 12)
         finally:
-            start(2)
-            wait_for_up(cluster, 2)
+            pass
 
     # TODO: can't be done in this class since we reuse the ccm cluster
     #       instead we should create these elsewhere
