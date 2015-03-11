@@ -763,6 +763,11 @@ class QueryTrace(object):
     The IP address of the host that acted as coordinator for this request.
     """
 
+    client = None
+    """
+    The IP address of the host that issued this request.
+    """
+
     parameters = None
     """
     A :class:`dict` of parameters for the traced operation, such as the
@@ -825,6 +830,7 @@ class QueryTrace(object):
             self.duration = timedelta(microseconds=session_row.duration)
             self.started_at = session_row.started_at
             self.coordinator = session_row.coordinator
+            self.client = session_row.client
             self.parameters = session_row.parameters
 
             log.debug("Attempting to fetch trace events for trace ID: %s", self.trace_id)
