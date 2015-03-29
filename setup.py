@@ -35,9 +35,10 @@ from distutils.core import Extension
 from distutils.errors import (CCompilerError, DistutilsPlatformError,
                               DistutilsExecError)
 from distutils.cmd import Command
-
+from subprocess import check_output
 
 import os
+import shlex
 import warnings
 
 try:
@@ -206,6 +207,8 @@ def run_setup(extensions):
 
     dependencies = ['futures', 'six >=1.6']
 
+    GIT_HEAD_REV = check_output(shlex.split('git rev-parse --short HEAD')).strip()
+
     setup(
         name='cassandra-driver',
         version=__version__,
@@ -234,6 +237,7 @@ def run_setup(extensions):
             'Programming Language :: Python :: Implementation :: PyPy',
             'Topic :: Software Development :: Libraries :: Python Modules'
         ],
+        options = dict(egg_info = dict(tag_build = "." + GIT_HEAD_REV)),
         **kw)
 
 extensions = [murmur3_ext, libev_ext]
