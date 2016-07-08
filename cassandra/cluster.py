@@ -2956,7 +2956,7 @@ class ControlConnection(object):
                 continue
             addr = self._rpc_from_peer_row(row)
             peer = self._cluster.metadata.get_host(addr)
-            if peer and peer.is_up and pm.distance(peer) != HostDistance.IGNORED:
+            if peer and peer.is_up is not False:
                 versions[schema_ver].add(addr)
 
         if len(versions) == 1:
