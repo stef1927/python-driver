@@ -31,7 +31,7 @@ from six.moves import filter, range, queue as Queue
 import socket
 import sys
 import time
-from threading import Lock, RLock, Thread, Event
+from threading import Lock, RLock, Thread, Event, Condition
 
 import weakref
 from weakref import WeakValueDictionary
@@ -57,8 +57,8 @@ from cassandra.protocol import (QueryMessage, ResultMessage,
                                 IsBootstrappingErrorMessage,
                                 BatchMessage, RESULT_KIND_PREPARED,
                                 RESULT_KIND_SET_KEYSPACE, RESULT_KIND_ROWS,
-                                RESULT_KIND_SCHEMA_CHANGE, MIN_SUPPORTED_VERSION,
-                                ProtocolHandler)
+                                RESULT_KIND_SCHEMA_CHANGE, RESULT_KIND_VOID,
+                                MIN_SUPPORTED_VERSION, ProtocolHandler)
 from cassandra.metadata import Metadata, protect_name, murmur3
 from cassandra.policies import (TokenAwarePolicy, DCAwareRoundRobinPolicy, SimpleConvictionPolicy,
                                 ExponentialReconnectionPolicy, HostDistance,
@@ -189,6 +189,38 @@ def default_lbp_factory():
     return DCAwareRoundRobinPolicy()
 
 
+class ContinuousPagingOptions(object):
+
+    class PagingUnit(object):
+        BYTES = 1
+        ROWS = 2
+
+    page_unit = None
+    """
+    Value of PagingUnit. Default is PagingUnit.ROWS.
+
+    Units refer to the :attr:`~.Statement.fetch_size` or :attr:`~.Session.default_fetch_size`.
+    """
+
+    max_pages = None
+    """
+    Max number of pages to send
+    """
+
+    max_pages_per_second = None
+    """
+    Max rate at which to send pages
+    """
+
+    def __init__(self, page_unit=PagingUnit.ROWS, max_pages=0, max_pages_per_second=0):
+        self.page_unit = page_unit
+        self.max_pages = max_pages
+        self.max_pages_per_second = max_pages_per_second
+
+    def page_unit_bytes(self):
+        return self.page_unit == ContinuousPagingOptions.PagingUnit.BYTES
+
+
 class ExecutionProfile(object):
     load_balancing_policy = None
     """
@@ -242,9 +274,19 @@ class ExecutionProfile(object):
     Defaults to :class:`.NoSpeculativeExecutionPolicy` if not specified
     """
 
+    continuous_paging_options = None
+    """
+    When set, requests will use Apollo's continuous paging, which streams multiple pages without
+    intermediate requests.
+
+    This has the potential to materialize all results in memory at once if the consumer cannot keep up. Use options
+    to constrain page size and rate.
+    """
+
     def __init__(self, load_balancing_policy=None, retry_policy=None,
                  consistency_level=ConsistencyLevel.LOCAL_ONE, serial_consistency_level=None,
-                 request_timeout=10.0, row_factory=named_tuple_factory, speculative_execution_policy=None):
+                 request_timeout=10.0, row_factory=named_tuple_factory, speculative_execution_policy=None,
+                 continuous_paging_options=None):
         self.load_balancing_policy = load_balancing_policy or default_lbp_factory()
         self.retry_policy = retry_policy or RetryPolicy()
         self.consistency_level = consistency_level
@@ -252,6 +294,7 @@ class ExecutionProfile(object):
         self.request_timeout = request_timeout
         self.row_factory = row_factory
         self.speculative_execution_policy = speculative_execution_policy or NoSpeculativeExecutionPolicy()
+        self.continuous_paging_options = continuous_paging_options
 
 
 class ProfileManager(object):
@@ -2062,6 +2105,7 @@ class Session(object):
             row_factory = self.row_factory
             load_balancing_policy = self.cluster.load_balancing_policy
             spec_exec_policy = None
+            continuous_paging_options = None
         else:
             execution_profile = self._get_execution_profile(execution_profile)
 
@@ -2075,7 +2119,7 @@ class Session(object):
             row_factory = execution_profile.row_factory
             load_balancing_policy = execution_profile.load_balancing_policy
             spec_exec_policy = execution_profile.speculative_execution_policy
-
+            continuous_paging_options = execution_profile.continuous_paging_options
 
         fetch_size = query.fetch_size
         if fetch_size is FETCH_SIZE_UNSET and self._protocol_version >= 2:
@@ -2094,14 +2138,13 @@ class Session(object):
             if parameters:
                 query_string = bind_params(query_string, parameters, self.encoder)
             message = QueryMessage(
-                query_string, cl, serial_cl,
-                fetch_size, timestamp=timestamp)
+                query_string, cl, serial_cl, fetch_size, paging_state, timestamp, continuous_paging_options)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
-                serial_cl, fetch_size,
-                timestamp=timestamp, skip_meta=bool(prepared_statement.result_metadata))
+                serial_cl, fetch_size, paging_state, timestamp,
+                skip_meta=bool(prepared_statement.result_metadata), continuous_paging_options=continuous_paging_options)
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -2113,11 +2156,9 @@ class Session(object):
                 serial_cl, timestamp)
 
         message.tracing = trace
-
         message.update_custom_payload(query.custom_payload)
         message.update_custom_payload(custom_payload)
         message.allow_beta_protocol_version = self.cluster.allow_beta_protocol_version
-        message.paging_state = paging_state
 
         spec_exec_plan = spec_exec_policy.new_plan(query.keyspace or self.keyspace, query) if query.is_idempotent and spec_exec_policy else None
         return ResponseFuture(
@@ -2212,17 +2253,17 @@ class Session(object):
         future = ResponseFuture(self, message, query=None, timeout=self.default_timeout)
         try:
             future.send_request()
-            query_id, bind_metadata, pk_indexes, result_metadata = future.result()
+            response = future.result()[0]
         except Exception:
             log.exception("Error preparing query:")
             raise
 
         prepared_statement = PreparedStatement.from_message(
-            query_id, bind_metadata, pk_indexes, self.cluster.metadata, query, self.keyspace,
-            self._protocol_version, result_metadata)
+            response.query_id, response.bind_metadata, response.pk_indexes, self.cluster.metadata, query, self.keyspace,
+            self._protocol_version, response.column_metadata)
         prepared_statement.custom_payload = future.custom_payload
 
-        self.cluster.add_prepared(query_id, prepared_statement)
+        self.cluster.add_prepared(response.query_id, prepared_statement)
 
         if self.cluster.prepare_on_all_hosts:
             host = future._current_host
@@ -2814,15 +2855,15 @@ class ControlConnection(object):
             peers_result, local_result = connection.wait_for_responses(
                 peers_query, local_query, timeout=self._timeout)
 
-        peers_result = dict_factory(*peers_result.results)
+        peers_result = dict_factory(peers_result.column_names, peers_result.parsed_rows)
 
         partitioner = None
         token_map = {}
 
         found_hosts = set()
-        if local_result.results:
+        if local_result.parsed_rows:
             found_hosts.add(connection.host)
-            local_rows = dict_factory(*(local_result.results))
+            local_rows = dict_factory(local_result.column_names, local_result.parsed_rows)
             local_row = local_rows[0]
             cluster_name = local_row["cluster_name"]
             self._cluster.metadata.cluster_name = cluster_name
@@ -3028,11 +3069,11 @@ class ControlConnection(object):
             return False
 
     def _get_schema_mismatches(self, peers_result, local_result, local_address):
-        peers_result = dict_factory(*peers_result.results)
+        peers_result = dict_factory(peers_result.column_names, peers_result.parsed_rows)
 
         versions = defaultdict(set)
-        if local_result.results:
-            local_row = dict_factory(*local_result.results)[0]
+        if local_result.parsed_rows:
+            local_row = dict_factory(local_result.column_names, local_result.parsed_rows)[0]
             if local_row.get("schema_version"):
                 versions[local_row.get("schema_version")].add(local_address)
 
@@ -3280,6 +3321,7 @@ class ResponseFuture(object):
     _timer = None
     _protocol_handler = ProtocolHandler
     _spec_execution_plan = NoSpeculativeExecutionPlan()
+    _continuous_paging_options = None
 
     _warned_timeout = False
 
@@ -3519,7 +3561,7 @@ class ResponseFuture(object):
                     # event loop thread.
                     if session:
                         session._set_keyspace_for_all_pools(
-                            response.results, self._set_keyspace_completed)
+                            response.new_keyspace, self._set_keyspace_completed)
                 elif response.kind == RESULT_KIND_SCHEMA_CHANGE:
                     # refresh the schema before responding, but do it in another
                     # thread instead of the event loop thread
@@ -3527,15 +3569,17 @@ class ResponseFuture(object):
                     self.session.submit(
                         refresh_schema_and_set_result,
                         self.session.cluster.control_connection,
-                        self, connection, **response.results)
+                        self, connection, **response.schema_change_event)
+                elif response.kind == RESULT_KIND_ROWS:
+                    self._paging_state = response.paging_state
+                    self._col_names = response.column_names
+                    self._col_types = response.column_types
+                    if self.message.continuous_paging_options:
+                        self._handle_continuous_paging_first_response(connection, response)
+                    else:
+                        self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
                 else:
-                    results = getattr(response, 'results', None)
-                    if results is not None and response.kind == RESULT_KIND_ROWS:
-                        self._paging_state = response.paging_state
-                        self._col_types = response.col_types
-                        self._col_names = results[0]
-                        results = self.row_factory(*results)
-                    self._set_final_result(results)
+                    self._set_final_result(response)
             elif isinstance(response, ErrorMessage):
                 retry_policy = self._retry_policy
 
@@ -3647,6 +3691,13 @@ class ResponseFuture(object):
             log.exception("Unexpected exception while handling result in ResponseFuture:")
             self._set_final_exception(exc)
 
+    def _handle_continuous_paging_first_response(self, connection, response):
+        self._continuous_paging_session = connection.new_continuous_paging_session(response.stream_id,
+                                                                                   self._protocol_handler.decode_message,
+                                                                                   self.row_factory)
+        self._set_final_result(self._continuous_paging_session.results())
+        self._continuous_paging_session.on_message(response)
+
     def _set_keyspace_completed(self, errors):
         if not errors:
             self._set_final_result(None)
@@ -3668,9 +3719,8 @@ class ResponseFuture(object):
         if isinstance(response, ResultMessage):
             if response.kind == RESULT_KIND_PREPARED:
                 # result metadata is the only thing that could have changed from an alter
-                _, _, _, result_metadata = response.results
                 if self.prepared_statement:
-                    self.prepared_statement.result_metadata = result_metadata
+                    self.prepared_statement.result_metadata = response.result_metadata
 
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection
@@ -3992,8 +4042,9 @@ class ResultSet(object):
                     self._current_rows = []
                 raise
 
-        self.fetch_next_page()
-        self._page_iter = iter(self._current_rows)
+        if not hasattr(self.response_future, '_continuous_paging_session'):
+            self.fetch_next_page()
+            self._page_iter = iter(self._current_rows)
 
         return next(self._page_iter)
 
@@ -4062,6 +4113,13 @@ class ResultSet(object):
         See :meth:`.ResponseFuture.get_all_query_traces` for details.
         """
         return self.response_future.get_all_query_traces(max_wait_sec_per)
+
+    def cancel_continuous_paging(self):
+        try:
+            self.response_future._continuous_paging_session.cancel()
+        except AttributeError:
+            log.exception('asdflkajsdflkjasdf')
+            raise DriverException("Attempted to cancel paging with no active session. This is only for requests with ContinuousdPagingOptions.")
 
     @property
     def was_applied(self):
