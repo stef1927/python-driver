@@ -24,7 +24,7 @@ from six.moves import range
 import socket
 import struct
 import sys
-from threading import Thread, Event, RLock
+from threading import Thread, Event, RLock, Condition
 import time
 
 try:
@@ -45,7 +45,8 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 InvalidRequestException, SupportedMessage,
                                 AuthResponseMessage, AuthChallengeMessage,
                                 AuthSuccessMessage, ProtocolException,
-                                MAX_SUPPORTED_VERSION, RegisterMessage)
+                                MAX_SUPPORTED_VERSION, RegisterMessage,
+                                CONTINUOUS_PAGING_OP_TYPE, CancelMessage, EventMessage)
 from cassandra.util import OrderedDict
 
 
@@ -169,6 +170,74 @@ class ProtocolError(Exception):
     pass
 
 
+class ContinuousPagingSession(object):
+    def __init__(self, stream_id, decoder, row_factory, connection):
+        self.stream_id = stream_id
+        self.decoder = decoder
+        self.row_factory = row_factory
+        self.connection = connection
+        self._condition = Condition()
+        self._stop = False
+        self._page_queue = deque()
+
+    def on_message(self, result):
+        if isinstance(result, ResultMessage):
+            self.on_page(result)
+        elif isinstance(result, ErrorMessage):
+            self.on_error(result)
+
+    def on_page(self, result):
+        with self._condition:
+            self._page_queue.appendleft((result.column_names, result.parsed_rows, None))
+            self._stop |= result.continuous_paging_last
+            self._condition.notify()
+
+        if result.continuous_paging_last:
+            self.connection.remove_continuous_paging_session(self.stream_id)
+
+    def on_error(self, error):
+        with self._condition:
+            self._page_queue.appendleft((None, None, error.to_exception()))
+            self._stop = True
+            self._condition.notify()
+
+        self.connection.remove_continuous_paging_session(self.stream_id)
+
+    def results(self):
+        with self._condition:
+            while True:
+                while not self._page_queue and not self._stop:
+                    # TODO: need to timeout here somehow
+                    self._condition.wait()
+                while self._page_queue:
+                    names, rows, err = self._page_queue.pop()
+                    if err:
+                        raise err
+                    self._condition.release()
+                    for row in self.row_factory(names, rows):
+                        yield row
+                    self._condition.acquire()
+                if self._stop:
+                    break
+
+    def cancel(self):
+        log.debug("Canceling paging session %s from %s", self.stream_id, self.connection.host)
+        self.connection.send_msg(CancelMessage(CONTINUOUS_PAGING_OP_TYPE, self.stream_id),
+                                 self.connection.get_request_id(),
+                                 self._on_cancel_response)
+        with self._condition:
+            self._stop = True
+            self._condition.notify()
+
+    def _on_cancel_response(self, response):
+        if isinstance(response, ResultMessage):
+            log.debug("Paging session %s canceled.", self.stream_id)
+        else:
+            log.error("Failed canceling streaming session %s from %s: %s", self.stream_id, self.connection.host,
+                      response.to_exception() if hasattr(response, 'to_exception') else response)
+        self.connection.remove_continuous_paging_session(self.stream_id)
+
+
 def defunct_on_error(f):
 
     @wraps(f)
@@ -269,6 +338,7 @@ class Connection(object):
         self._push_watchers = defaultdict(set)
         self._requests = {}
         self._iobuf = io.BytesIO()
+        self._continuous_paging_sessions = {}
 
         if ssl_options:
             self._check_hostname = bool(self.ssl_options.pop('check_hostname', False))
@@ -442,12 +512,15 @@ class Connection(object):
             return self.highest_request_id
 
     def handle_pushed(self, response):
-        log.debug("Message pushed from server: %r", response)
-        for cb in self._push_watchers.get(response.event_type, []):
-            try:
-                cb(response.event_args)
-            except Exception:
-                log.exception("Pushed event handler errored, ignoring:")
+        if isinstance(response, EventMessage):
+            log.debug("EventMessage pushed from server: %r", response)
+            for cb in self._push_watchers.get(response.event_type, []):
+                try:
+                    cb(response.event_args)
+                except Exception:
+                    log.exception("Pushed event handler errored, ignoring:")
+        else:
+            log.debug("Unexpected message pushed from server: %r", response)
 
     def send_msg(self, msg, request_id, cb, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=None):
         if self.is_defunct:
@@ -541,8 +614,8 @@ class Connection(object):
         pos = len(buf)
         if pos:
             version = int_from_buf_item(buf[0]) & PROTOCOL_VERSION_MASK
-            if version > MAX_SUPPORTED_VERSION:
-                raise ProtocolError("This version of the driver does not support protocol version %d" % version)
+            #if version > MAX_SUPPORTED_VERSION:
+            #    raise ProtocolError("This version of the driver does not support protocol version %d" % version)
             frame_header = frame_header_v3 if version >= 3 else frame_header_v1_v2
             # this frame header struct is everything after the version byte
             header_size = frame_header.size + 1
@@ -585,9 +658,13 @@ class Connection(object):
             decoder = ProtocolHandler.decode_message
             result_metadata = None
         else:
-            callback, decoder, result_metadata = self._requests.pop(stream_id)
-            with self.lock:
-                self.request_ids.append(stream_id)
+            if stream_id in self._requests:
+                callback, decoder, result_metadata = self._requests.pop(stream_id)
+            elif stream_id in self._continuous_paging_sessions:
+                paging_session = self._continuous_paging_sessions[stream_id]
+                callback = paging_session.on_message
+                decoder = paging_session.decoder
+                result_metadata = None
 
         self.msg_received = True
 
@@ -616,6 +693,24 @@ class Connection(object):
                 self.handle_pushed(response)
         except Exception:
             log.exception("Callback handler errored, ignoring:")
+
+        # done after callback because the callback might signal this as a paging session
+        if stream_id >= 0 and stream_id not in self._continuous_paging_sessions:
+            with self.lock:
+                self.request_ids.append(stream_id)
+
+    def new_continuous_paging_session(self, stream_id, decoder, row_factory):
+        session = ContinuousPagingSession(stream_id, decoder, row_factory, self)
+        self._continuous_paging_sessions[stream_id] = session
+        return session
+
+    def remove_continuous_paging_session(self, stream_id):
+        try:
+            self._continuous_paging_sessions.pop(stream_id)
+            with self.lock:
+                self.request_ids.append(stream_id)
+        except KeyError:
+            pass
 
     @defunct_on_error
     def _send_options_message(self):
