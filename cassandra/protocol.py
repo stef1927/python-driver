@@ -571,19 +571,21 @@ class ResultMessage(_MessageType):
     _HAS_MORE_PAGES_FLAG = 0x0002
     _NO_METADATA_FLAG = 0x0004
 
-    def __init__(self, kind, results, paging_state=None):
+    def __init__(self, kind, results, paging_state=None, col_types=None):
         self.kind = kind
         self.results = results
         self.paging_state = paging_state
+        self.col_types = col_types
 
     @classmethod
     def recv_body(cls, f, protocol_version, user_type_map, result_metadata):
         kind = read_int(f)
         paging_state = None
+        col_types = None
         if kind == RESULT_KIND_VOID:
             results = None
         elif kind == RESULT_KIND_ROWS:
-            paging_state, results = cls.recv_results_rows(
+            paging_state, col_types, results = cls.recv_results_rows(
                 f, protocol_version, user_type_map, result_metadata)
         elif kind == RESULT_KIND_SET_KEYSPACE:
             ksname = read_string(f)
@@ -594,7 +596,7 @@ class ResultMessage(_MessageType):
             results = cls.recv_results_schema_change(f, protocol_version)
         else:
             raise DriverException("Unknown RESULT kind: %d" % kind)
-        return cls(kind, results, paging_state)
+        return cls(kind, results, paging_state, col_types)
 
     @classmethod
     def recv_results_rows(cls, f, protocol_version, user_type_map, result_metadata):
@@ -608,7 +610,7 @@ class ResultMessage(_MessageType):
             tuple(ctype.from_binary(val, protocol_version)
                   for ctype, val in zip(coltypes, row))
             for row in rows]
-        return paging_state, (colnames, parsed_rows)
+        return paging_state, coltypes, (colnames, parsed_rows)
 
     @classmethod
     def recv_results_prepared(cls, f, protocol_version, user_type_map):
