@@ -189,7 +189,6 @@ def default_lbp_factory():
     return DCAwareRoundRobinPolicy()
 
 
-# TODO: should this be in protocol?
 class AsyncPagingOptions(object):
 
     class PagingUnit(object):
@@ -200,6 +199,8 @@ class AsyncPagingOptions(object):
     page_size = None
     max_pages = None
     max_pages_per_second = None
+
+    uuid = None
 
     def __init__(self, page_unit=PagingUnit.ROWS, page_size=5000, max_pages=0, max_pages_per_second=0):
         self.page_unit = page_unit
@@ -2124,8 +2125,7 @@ class Session(object):
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
-                skip_meta=bool(prepared_statement.result_metadata),
-                async_paging_options=async_paging_options)
+                skip_meta=bool(prepared_statement.result_metadata), async_paging_options=async_paging_options)
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -2137,9 +2137,9 @@ class Session(object):
                 serial_cl, timestamp)
 
         message.tracing = trace
-
         message.update_custom_payload(query.custom_payload)
         message.update_custom_payload(custom_payload)
+        message.inject_dse_payloads()
         message.allow_beta_protocol_version = self.cluster.allow_beta_protocol_version
 
         spec_exec_plan = spec_exec_policy.new_plan(query.keyspace or self.keyspace, query) if query.is_idempotent and spec_exec_policy else None
@@ -3543,7 +3543,7 @@ class ResponseFuture(object):
                     # event loop thread.
                     if session:
                         session._set_keyspace_for_all_pools(
-                            response.results, self._set_keyspace_completed)
+                            response.new_keyspace, self._set_keyspace_completed)
                 elif response.kind == RESULT_KIND_SCHEMA_CHANGE:
                     # refresh the schema before responding, but do it in another
                     # thread instead of the event loop thread
@@ -3557,11 +3557,12 @@ class ResponseFuture(object):
                     self._col_names = response.column_names
                     self._col_types = response.column_types
                     self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
-                elif response.kind == RESULT_KIND_VOID and self.message.paging_id is not None:
-                    async_paging_session = connection.new_async_paging_session(self.message.paging_id, self.row_factory)
-                    self._set_final_result(async_paging_session.results())
                 else:
-                    self._set_final_result(response)
+                    if response.kind == RESULT_KIND_VOID and self.message.async_paging_id is not None:
+                        self._async_paging_session = connection.new_async_paging_session(self.message.async_paging_id, self.row_factory)
+                        self._set_final_result(self._async_paging_session.results())
+                    else:
+                        self._set_final_result(response)
             elif isinstance(response, ErrorMessage):
                 retry_policy = self._retry_policy
 
@@ -4086,6 +4087,12 @@ class ResultSet(object):
         See :meth:`.ResponseFuture.get_all_query_traces` for details.
         """
         return self.response_future.get_all_query_traces(max_wait_sec_per)
+
+    def cancel_async_paging(self):
+        try:
+            self.response_future._async_paging_session.cancel()
+        except AttributeError:
+            raise DriverException("Attempted to cancel paging with no active session. This is only for requests with AsyncPagingOptions.")
 
     @property
     def was_applied(self):

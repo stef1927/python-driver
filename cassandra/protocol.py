@@ -86,6 +86,7 @@ class _RegisterMessageType(type):
         if not name.startswith('_'):
             register_class(cls)
 
+CORE_OPTIMIZED_PAGING = 'core.optimized.paging'
 
 @six.add_metaclass(_RegisterMessageType)
 class _MessageType(object):
@@ -93,7 +94,11 @@ class _MessageType(object):
     tracing = False
     custom_payload = None
     warnings = None
+
     async_paging_options = None
+    async_paging_id = None
+    async_paging_seq = None
+    async_paging_last = None
 
     def update_custom_payload(self, other):
         if other:
@@ -102,6 +107,31 @@ class _MessageType(object):
             self.custom_payload.update(other)
             if len(self.custom_payload) > 65535:
                 raise ValueError("Custom payload map exceeds max count allowed by protocol (65535)")
+
+    # TODO: this would be done at a higher level in the DSE driver when we refactor
+    def inject_dse_payloads(self):
+        payload = {}
+        if self.async_paging_options:
+            buf = io.BytesIO()
+            apo = self.async_paging_options
+            self.async_paging_id = uuid1()
+            buf.write(self.async_paging_id.bytes)
+            write_int(buf, apo.page_size)
+            write_int(buf, apo.page_unit)
+            write_int(buf, apo.max_pages)
+            write_int(buf, apo.max_pages_per_second)
+            payload['core.optimized.paging'] = buf.getvalue()
+        self.update_custom_payload(payload)
+
+    # TODO: same
+    def extract_dse_payloads(self):
+        if self.custom_payload:
+            value = self.custom_payload.get(CORE_OPTIMIZED_PAGING)
+            if value:
+                buf = io.BytesIO(value)
+                self.async_paging_id = UUID(bytes=buf.read(16))
+                self.async_paging_seq = read_int(buf)
+                self.async_paging_last = bool(read_byte(buf))
 
     def __repr__(self):
         return '<%s(%s)>' % (self.__class__.__name__, ', '.join('%s=%r' % i for i in _get_params(self)))
@@ -511,9 +541,9 @@ _WITH_PAGING_STATE_FLAG = 0x08
 _WITH_SERIAL_CONSISTENCY_FLAG = 0x10
 _PROTOCOL_TIMESTAMP_FLAG = 0x20
 _NAMES_FOR_VALUES_FLAG = 0x40  # not used here
-_EXTENDED_FLAGS_FLAG = 0X80
 
 _PAGING_OPTIONS_FLAG = 0x80000000
+
 
 class QueryMessage(_MessageType):
     opcode = 0x07
@@ -529,13 +559,11 @@ class QueryMessage(_MessageType):
         self.timestamp = timestamp
         self._query_params = None  # only used internally. May be set to a list of native-encoded values to have them sent with the request.
         self.async_paging_options = async_paging_options
-        self.paging_id = uuid1() if self.async_paging_options else None
 
     def send_body(self, f, protocol_version):
         write_longstring(f, self.query)
         write_consistency_level(f, self.consistency_level)
         flags = 0x00
-        extended_flags = 0x00
         if self._query_params is not None:
             flags |= _VALUES_FLAG  # also v2+, but we're only setting params internally right now
 
@@ -593,13 +621,6 @@ class QueryMessage(_MessageType):
             write_consistency_level(f, self.serial_consistency_level)
         if self.timestamp is not None:
             write_long(f, self.timestamp)
-        if self.async_paging_options:
-            apo = self.async_paging_options
-            f.write(self.paging_id.bytes)
-            write_int(f, apo.page_size)
-            write_int(f, apo.page_unit)
-            write_int(f, apo.max_pages)
-            write_int(f, apo.max_pages_per_second)
 
 
 CUSTOM_TYPE = object()
@@ -822,7 +843,6 @@ class ExecuteMessage(_MessageType):
         self.timestamp = timestamp
         self.skip_meta = skip_meta
         self.async_paging_options = async_paging_options
-        self.paging_id = uuid1() if self.async_paging_options else None
 
     def send_body(self, f, protocol_version):
         write_string(f, self.query_id)
@@ -998,6 +1018,24 @@ class EventMessage(_MessageType):
         return event
 
 
+ASYNC_PAGING_OP_TYPE = 1
+
+
+# TODO: DSE message type
+class CancelMessage(_MessageType):
+    #TODO: this opcode is wrong, based on a mistake in the current PR
+    opcode = 0x11
+    name = 'CANCEL'
+
+    def __init__(self, op_type, op_id):
+        self.op_type  = op_type
+        self.op_id = op_id
+
+    def send_body(self, f, protocol_version):
+        write_int(f, self.op_type)
+        f.write(self.op_id.bytes)
+
+
 class _ProtocolHandler(object):
     """
     _ProtocolHander handles encoding and decoding messages.
@@ -1111,6 +1149,7 @@ class _ProtocolHandler(object):
         msg.stream_id = stream_id
         msg.trace_id = trace_id
         msg.custom_payload = custom_payload
+        msg.extract_dse_payloads()
         msg.warnings = warnings
 
         if msg.warnings:

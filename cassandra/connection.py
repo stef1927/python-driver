@@ -45,7 +45,8 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 InvalidRequestException, SupportedMessage,
                                 AuthResponseMessage, AuthChallengeMessage,
                                 AuthSuccessMessage, ProtocolException,
-                                MAX_SUPPORTED_VERSION, RegisterMessage)
+                                MAX_SUPPORTED_VERSION, RegisterMessage,
+                                ASYNC_PAGING_OP_TYPE, CancelMessage)
 from cassandra.util import OrderedDict
 
 
@@ -179,11 +180,12 @@ class AsyncPagingSession(object):
         self._page_queue = []
 
     def on_page(self, result):
+        print 'page', len(result.parsed_rows)
         with self._condition:
             heappush(self._page_queue, (result.column_names, result.parsed_rows))
-            self._stop |= result.is_last_async_page
+            self._stop |= result.async_paging_last
             self._condition.notify()
-        if result.is_last_async_page:
+        if result.async_paging_last:
             self.connection.remove_async_paging_session(self.paging_id)
 
     def results(self):
@@ -199,7 +201,17 @@ class AsyncPagingSession(object):
                     self._condition.acquire()
 
     def cancel(self):
-        pass
+        log.debug("Canceling paging session %s from %s", self.paging_id, self.connection.host)
+        self.connection.send_msg(CancelMessage(ASYNC_PAGING_OP_TYPE, self.paging_id),
+                                 self.connection.get_request_id(),
+                                 self._on_cancel_response)
+
+    def _on_cancel_response(self, response):
+        if isinstance(response, ResultMessage):
+            log.debug("Paging session %s canceled.", self.paging_id)
+        else:
+            log.error("Failed canceling streaming session %s from %s: %s", self.paging_id, self.connection.host,
+                      response.to_exception() if hasattr(response, 'to_exception') else response)
 
 
 def defunct_on_error(f):
@@ -582,8 +594,8 @@ class Connection(object):
         pos = len(buf)
         if pos:
             version = int_from_buf_item(buf[0]) & PROTOCOL_VERSION_MASK
-            if version > MAX_SUPPORTED_VERSION:
-                raise ProtocolError("This version of the driver does not support protocol version %d" % version)
+            #if version > MAX_SUPPORTED_VERSION:
+            #    raise ProtocolError("This version of the driver does not support protocol version %d" % version)
             frame_header = frame_header_v3 if version >= 3 else frame_header_v1_v2
             # this frame header struct is everything after the version byte
             header_size = frame_header.size + 1
