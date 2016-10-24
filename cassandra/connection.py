@@ -180,7 +180,6 @@ class AsyncPagingSession(object):
         self._page_queue = []
 
     def on_page(self, result):
-        print 'page', len(result.parsed_rows)
         with self._condition:
             heappush(self._page_queue, (result.column_names, result.parsed_rows))
             self._stop |= result.async_paging_last
@@ -205,6 +204,9 @@ class AsyncPagingSession(object):
         self.connection.send_msg(CancelMessage(ASYNC_PAGING_OP_TYPE, self.paging_id),
                                  self.connection.get_request_id(),
                                  self._on_cancel_response)
+        with self._condition:
+            self._stop = True
+            self._condition.notify()
 
     def _on_cancel_response(self, response):
         if isinstance(response, ResultMessage):
