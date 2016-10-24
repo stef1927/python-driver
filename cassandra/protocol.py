@@ -1023,8 +1023,7 @@ ASYNC_PAGING_OP_TYPE = 1
 
 # TODO: DSE message type
 class CancelMessage(_MessageType):
-    #TODO: this opcode is wrong, based on a mistake in the current PR
-    opcode = 0x11
+    opcode = 0xFF
     name = 'CANCEL'
 
     def __init__(self, op_type, op_id):
