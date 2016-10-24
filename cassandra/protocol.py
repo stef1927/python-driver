@@ -95,10 +95,10 @@ class _MessageType(object):
     custom_payload = None
     warnings = None
 
-    async_paging_options = None
-    async_paging_id = None
-    async_paging_seq = None
-    async_paging_last = None
+    optimized_paging_options = None
+    optimized_paging_id = None
+    optimized_paging_seq = None
+    optimized_paging_last = None
 
     def update_custom_payload(self, other):
         if other:
@@ -111,11 +111,11 @@ class _MessageType(object):
     # TODO: this would be done at a higher level in the DSE driver when we refactor
     def inject_dse_payloads(self):
         payload = {}
-        if self.async_paging_options:
+        if self.optimized_paging_options:
             buf = io.BytesIO()
-            apo = self.async_paging_options
-            self.async_paging_id = uuid1()
-            buf.write(self.async_paging_id.bytes)
+            apo = self.optimized_paging_options
+            self.optimized_paging_id = uuid1()
+            buf.write(self.optimized_paging_id.bytes)
             write_int(buf, apo.page_size)
             write_int(buf, apo.page_unit)
             write_int(buf, apo.max_pages)
@@ -129,9 +129,9 @@ class _MessageType(object):
             value = self.custom_payload.get(CORE_OPTIMIZED_PAGING)
             if value:
                 buf = io.BytesIO(value)
-                self.async_paging_id = UUID(bytes=buf.read(16))
-                self.async_paging_seq = read_int(buf)
-                self.async_paging_last = bool(read_byte(buf))
+                self.optimized_paging_id = UUID(bytes=buf.read(16))
+                self.optimized_paging_seq = read_int(buf)
+                self.optimized_paging_last = bool(read_byte(buf))
 
     def __repr__(self):
         return '<%s(%s)>' % (self.__class__.__name__, ', '.join('%s=%r' % i for i in _get_params(self)))
@@ -550,7 +550,7 @@ class QueryMessage(_MessageType):
     name = 'QUERY'
 
     def __init__(self, query, consistency_level, serial_consistency_level=None,
-                 fetch_size=None, paging_state=None, timestamp=None, async_paging_options=None):
+                 fetch_size=None, paging_state=None, timestamp=None, optimized_paging_options=None):
         self.query = query
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
@@ -558,7 +558,7 @@ class QueryMessage(_MessageType):
         self.paging_state = paging_state
         self.timestamp = timestamp
         self._query_params = None  # only used internally. May be set to a list of native-encoded values to have them sent with the request.
-        self.async_paging_options = async_paging_options
+        self.optimized_paging_options = optimized_paging_options
 
     def send_body(self, f, protocol_version):
         write_longstring(f, self.query)
@@ -642,7 +642,7 @@ class ResultMessage(_MessageType):
     _FLAGS_GLOBAL_TABLES_SPEC = 0x0001
     _HAS_MORE_PAGES_FLAG = 0x0002
     _NO_METADATA_FLAG = 0x0004
-    _ASYNC_PAGING_FLAG = 0x0008
+    _OPTIMIZED_PAGING_FLAG = 0x0008
 
     kind = None
 
@@ -651,9 +651,9 @@ class ResultMessage(_MessageType):
     column_types = None
     parsed_rows = None
     paging_state = None
-    async_paging_id = None
-    async_page_sequence = None
-    is_last_async_page = None
+    optimized_paging_id = None
+    optimized_page_sequence = None
+    is_last_optimized_page = None
     new_keyspace = None
     column_metadata = None
     query_id = None
@@ -738,10 +738,10 @@ class ResultMessage(_MessageType):
             column_metadata.append((colksname, colcfname, colname, coltype))
 
         self.column_metadata = column_metadata
-        if flags & self._ASYNC_PAGING_FLAG:
-            self.async_paging_id = UUID(bytes=f.read(16))
-            self.async_page_sequence = read_int(f)
-            self.is_last_async_page = bool(read_byte(f))
+        if flags & self._OPTIMIZED_PAGING_FLAG:
+            self.optimized_paging_id = UUID(bytes=f.read(16))
+            self.optimized_page_sequence = read_int(f)
+            self.is_last_optimized_page = bool(read_byte(f))
 
     def recv_prepared_metadata(self, f, protocol_version, user_type_map):
         flags = read_int(f)
@@ -833,7 +833,7 @@ class ExecuteMessage(_MessageType):
     def __init__(self, query_id, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
                  paging_state=None, timestamp=None, skip_meta=False,
-                 async_paging_options=None):
+                 optimized_paging_options=None):
         self.query_id = query_id
         self.query_params = query_params
         self.consistency_level = consistency_level
@@ -842,7 +842,7 @@ class ExecuteMessage(_MessageType):
         self.paging_state = paging_state
         self.timestamp = timestamp
         self.skip_meta = skip_meta
-        self.async_paging_options = async_paging_options
+        self.optimized_paging_options = optimized_paging_options
 
     def send_body(self, f, protocol_version):
         write_string(f, self.query_id)
@@ -1018,8 +1018,7 @@ class EventMessage(_MessageType):
         return event
 
 
-ASYNC_PAGING_OP_TYPE = 1
-
+OPTIMIZED_PAGING_OP_TYPE = 1
 
 # TODO: DSE message type
 class CancelMessage(_MessageType):

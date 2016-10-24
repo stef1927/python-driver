@@ -46,7 +46,7 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 AuthResponseMessage, AuthChallengeMessage,
                                 AuthSuccessMessage, ProtocolException,
                                 MAX_SUPPORTED_VERSION, RegisterMessage,
-                                ASYNC_PAGING_OP_TYPE, CancelMessage)
+                                OPTIMIZED_PAGING_OP_TYPE, CancelMessage)
 from cassandra.util import OrderedDict
 
 
@@ -170,7 +170,7 @@ class ProtocolError(Exception):
     pass
 
 
-class AsyncPagingSession(object):
+class OptimizedPagingSession(object):
     def __init__(self, paging_id, row_factory, connection):
         self.paging_id = paging_id
         self.row_factory = row_factory
@@ -182,10 +182,10 @@ class AsyncPagingSession(object):
     def on_page(self, result):
         with self._condition:
             heappush(self._page_queue, (result.column_names, result.parsed_rows))
-            self._stop |= result.async_paging_last
+            self._stop |= result.optimized_paging_last
             self._condition.notify()
-        if result.async_paging_last:
-            self.connection.remove_async_paging_session(self.paging_id)
+        if result.optimized_paging_last:
+            self.connection.remove_optimized_paging_session(self.paging_id)
 
     def results(self):
         with self._condition:
@@ -201,7 +201,7 @@ class AsyncPagingSession(object):
 
     def cancel(self):
         log.debug("Canceling paging session %s from %s", self.paging_id, self.connection.host)
-        self.connection.send_msg(CancelMessage(ASYNC_PAGING_OP_TYPE, self.paging_id),
+        self.connection.send_msg(CancelMessage(OPTIMIZED_PAGING_OP_TYPE, self.paging_id),
                                  self.connection.get_request_id(),
                                  self._on_cancel_response)
         with self._condition:
@@ -214,6 +214,7 @@ class AsyncPagingSession(object):
         else:
             log.error("Failed canceling streaming session %s from %s: %s", self.paging_id, self.connection.host,
                       response.to_exception() if hasattr(response, 'to_exception') else response)
+        self.connection.remove_optimized_paging_session(self.paging_id)
 
 
 def defunct_on_error(f):
@@ -316,7 +317,7 @@ class Connection(object):
         self._push_watchers = defaultdict(set)
         self._requests = {}
         self._iobuf = io.BytesIO()
-        self._async_paging_sessions = {}
+        self._optimized_paging_sessions = {}
 
         if ssl_options:
             self._check_hostname = bool(self.ssl_options.pop('check_hostname', False))
@@ -491,11 +492,11 @@ class Connection(object):
 
     def handle_pushed(self, response):
         if isinstance(response, ResultMessage):
-            paging_session = self._async_paging_sessions.get(response.async_paging_id)
+            paging_session = self._optimized_paging_sessions.get(response.optimized_paging_id)
             if paging_session:
                 paging_session.on_page(response)
             else:
-                log.warn("Received asynchronous paging message for unregistered id: %s", response.async_paging_id)
+                log.warn("Received optimized paging message for unregistered id: %s", response.optimized_paging_id)
         else:
             log.debug("Message pushed from server: %r", response)
             for cb in self._push_watchers.get(response.event_type, []):
@@ -672,13 +673,13 @@ class Connection(object):
         except Exception:
             log.exception("Callback handler errored, ignoring:")
 
-    def new_async_paging_session(self, paging_id, row_factory):
-        session = AsyncPagingSession(paging_id, row_factory, self)
-        self._async_paging_sessions[paging_id] = session
+    def new_optimized_paging_session(self, paging_id, row_factory):
+        session = OptimizedPagingSession(paging_id, row_factory, self)
+        self._optimized_paging_sessions[paging_id] = session
         return session
 
-    def remove_async_paging_session(self, paging_id):
-        self._async_paging_sessions.pop(paging_id)
+    def remove_optimized_paging_session(self, paging_id):
+        self._optimized_paging_sessions.pop(paging_id)
 
     @defunct_on_error
     def _send_options_message(self):
