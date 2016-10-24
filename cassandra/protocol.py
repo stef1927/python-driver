@@ -676,7 +676,7 @@ class ResultMessage(_MessageType):
         elif self.kind == RESULT_KIND_SCHEMA_CHANGE:
             self.recv_results_schema_change(f, protocol_version)
         else:
-            raise DriverException("Unknown RESULT kind: %d" % kind)
+            raise DriverException("Unknown RESULT kind: %d" % self.kind)
 
     @classmethod
     def recv_body(cls, f, protocol_version, user_type_map, result_metadata):
@@ -1183,7 +1183,7 @@ def cython_protocol_handler(colparser):
         """
         # type_codes = ResultMessage.type_codes.copy()
         code_to_type = dict((v, k) for k, v in ResultMessage.type_codes.items())
-        recv_results_rows = classmethod(make_recv_results_rows(colparser))
+        recv_results_rows = make_recv_results_rows(colparser)
 
     class CythonProtocolHandler(_ProtocolHandler):
         """
