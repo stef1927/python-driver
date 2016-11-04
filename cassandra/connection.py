@@ -46,7 +46,7 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 AuthResponseMessage, AuthChallengeMessage,
                                 AuthSuccessMessage, ProtocolException,
                                 MAX_SUPPORTED_VERSION, RegisterMessage,
-                                OPTIMIZED_PAGING_OP_TYPE, CancelMessage)
+                                OPTIMIZED_PAGING_OP_TYPE, CancelMessage, EventMessage)
 from cassandra.util import OrderedDict
 
 
@@ -191,6 +191,7 @@ class OptimizedPagingSession(object):
         with self._condition:
             while not self._stop:
                 while not self._page_queue and not self._stop:
+                    # TODO: need to timeout here somehow
                     self._condition.wait()
                 while self._page_queue:
                     names, rows = heappop(self._page_queue)
@@ -497,13 +498,15 @@ class Connection(object):
                 paging_session.on_page(response)
             else:
                 log.warn("Received optimized paging message for unregistered id: %s", response.optimized_paging_id)
-        else:
-            log.debug("Message pushed from server: %r", response)
+        elif isinstance(response, EventMessage):
+            log.debug("EventMessage pushed from server: %r", response)
             for cb in self._push_watchers.get(response.event_type, []):
                 try:
                     cb(response.event_args)
                 except Exception:
                     log.exception("Pushed event handler errored, ignoring:")
+        else:
+            log.debug("Unexpected message pushed from server: %r", response)
 
     def send_msg(self, msg, request_id, cb, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=None):
         if self.is_defunct:

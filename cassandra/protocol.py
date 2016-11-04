@@ -30,7 +30,7 @@ from cassandra import (Unavailable, WriteTimeout, ReadTimeout,
                        UserAggregateDescriptor, SchemaTargetType)
 from cassandra.marshal import (int32_pack, int32_unpack, uint16_pack, uint16_unpack,
                                uint8_pack, int8_unpack, uint64_pack, header_pack,
-                               v3_header_pack)
+                               v3_header_pack, uint32_pack)
 from cassandra.cqltypes import (AsciiType, BytesType, BooleanType,
                                 CounterColumnType, DateType, DecimalType,
                                 DoubleType, FloatType, Int32Type,
@@ -95,11 +95,6 @@ class _MessageType(object):
     custom_payload = None
     warnings = None
 
-    optimized_paging_options = None
-    optimized_paging_id = None
-    optimized_paging_seq = None
-    optimized_paging_last = None
-
     def update_custom_payload(self, other):
         if other:
             if not self.custom_payload:
@@ -107,31 +102,6 @@ class _MessageType(object):
             self.custom_payload.update(other)
             if len(self.custom_payload) > 65535:
                 raise ValueError("Custom payload map exceeds max count allowed by protocol (65535)")
-
-    # TODO: this would be done at a higher level in the DSE driver when we refactor
-    def inject_dse_payloads(self):
-        payload = {}
-        if self.optimized_paging_options:
-            buf = io.BytesIO()
-            apo = self.optimized_paging_options
-            self.optimized_paging_id = uuid1()
-            buf.write(self.optimized_paging_id.bytes)
-            write_int(buf, apo.page_size)
-            write_int(buf, apo.page_unit)
-            write_int(buf, apo.max_pages)
-            write_int(buf, apo.max_pages_per_second)
-            payload['core.optimized.paging'] = buf.getvalue()
-        self.update_custom_payload(payload)
-
-    # TODO: same
-    def extract_dse_payloads(self):
-        if self.custom_payload:
-            value = self.custom_payload.get(CORE_OPTIMIZED_PAGING)
-            if value:
-                buf = io.BytesIO(value)
-                self.optimized_paging_id = UUID(bytes=buf.read(16))
-                self.optimized_paging_seq = read_int(buf)
-                self.optimized_paging_last = bool(read_byte(buf))
 
     def __repr__(self):
         return '<%s(%s)>' % (self.__class__.__name__, ', '.join('%s=%r' % i for i in _get_params(self)))
@@ -544,28 +514,26 @@ _NAMES_FOR_VALUES_FLAG = 0x40  # not used here
 
 _PAGING_OPTIONS_FLAG = 0x80000000
 
+class _QueryMessage(_MessageType):
 
-class QueryMessage(_MessageType):
-    opcode = 0x07
-    name = 'QUERY'
-
-    def __init__(self, query, consistency_level, serial_consistency_level=None,
-                 fetch_size=None, paging_state=None, timestamp=None, optimized_paging_options=None):
-        self.query = query
+    def __init__(self, query_params, consistency_level,
+                 serial_consistency_level=None, fetch_size=None,
+                 paging_state=None, timestamp=None, skip_meta=False,
+                 optimized_paging_options=None):
+        self.query_params = query_params
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
         self.fetch_size = fetch_size
         self.paging_state = paging_state
         self.timestamp = timestamp
-        self._query_params = None  # only used internally. May be set to a list of native-encoded values to have them sent with the request.
+        self.skip_meta = skip_meta
         self.optimized_paging_options = optimized_paging_options
 
-    def send_body(self, f, protocol_version):
-        write_longstring(f, self.query)
+    def _write_query_params(self, f, protocol_version):
         write_consistency_level(f, self.consistency_level)
         flags = 0x00
-        if self._query_params is not None:
-            flags |= _VALUES_FLAG  # also v2+, but we're only setting params internally right now
+        if self.query_params is not None:
+            flags |= _VALUES_FLAG
 
         if self.serial_consistency_level:
             if protocol_version >= 2:
@@ -595,24 +563,23 @@ class QueryMessage(_MessageType):
         if self.timestamp is not None:
             flags |= _PROTOCOL_TIMESTAMP_FLAG
 
-        if self.async_paging_options:
+        if self.optimized_paging_options:
             if protocol_version >= 5:
                 flags |= _PAGING_OPTIONS_FLAG
             else:
                 raise UnsupportedOperation(
-                    "Asynchronous paging may only be used with protocol version "
+                    "Optimized paging may only be used with protocol version "
                     "5 or higher. Consider setting Cluster.protocol_version to 5.")
 
         if protocol_version >= 5:
-            write_int(f, flags)
+            write_uint(f, flags)
         else:
             write_byte(f, flags)
 
-        if self._query_params is not None:
-            write_short(f, len(self._query_params))
-            for param in self._query_params:
+        if self.query_params is not None:
+            write_short(f, len(self.query_params))
+            for param in self.query_params:
                 write_value(f, param)
-
         if self.fetch_size:
             write_int(f, self.fetch_size)
         if self.paging_state:
@@ -621,6 +588,48 @@ class QueryMessage(_MessageType):
             write_consistency_level(f, self.serial_consistency_level)
         if self.timestamp is not None:
             write_long(f, self.timestamp)
+        if self.optimized_paging_options:
+            self.optimized_paging_id = uuid1()
+            self._write_paging_options(f, self.optimized_paging_id, self.optimized_paging_options)
+
+    def _write_paging_options(self, f, id, paging_options):
+        f.write(id.bytes)
+        write_int(f, paging_options.page_size)
+        write_int(f, paging_options.page_unit)
+        write_int(f, paging_options.max_pages)
+        write_int(f, paging_options.max_pages_per_second)
+
+
+class QueryMessage(_QueryMessage):
+    opcode = 0x07
+    name = 'QUERY'
+
+    def __init__(self, query, consistency_level, serial_consistency_level=None,
+                 fetch_size=None, paging_state=None, timestamp=None, optimized_paging_options=None):
+        self.query = query
+        super(QueryMessage, self).__init__(None, consistency_level, serial_consistency_level, fetch_size,
+                                           paging_state, timestamp, False, optimized_paging_options)
+
+    def send_body(self, f, protocol_version):
+        write_longstring(f, self.query)
+        self._write_query_params(f, protocol_version)
+
+
+class ExecuteMessage(_QueryMessage):
+    opcode = 0x0A
+    name = 'EXECUTE'
+
+    def __init__(self, query_id, query_params, consistency_level,
+                 serial_consistency_level=None, fetch_size=None,
+                 paging_state=None, timestamp=None, skip_meta=False,
+                 optimized_paging_options=None):
+        self.query_id = query_id
+        super(ExecuteMessage, self).__init__(query_params, consistency_level, serial_consistency_level, fetch_size,
+                                             paging_state, timestamp, skip_meta, optimized_paging_options)
+
+    def send_body(self, f, protocol_version):
+        write_string(f, self.query_id)
+        self._write_query_params(f, protocol_version)
 
 
 CUSTOM_TYPE = object()
@@ -642,7 +651,7 @@ class ResultMessage(_MessageType):
     _FLAGS_GLOBAL_TABLES_SPEC = 0x0001
     _HAS_MORE_PAGES_FLAG = 0x0002
     _NO_METADATA_FLAG = 0x0004
-    _OPTIMIZED_PAGING_FLAG = 0x0008
+    _OPTIMIZED_PAGING_FLAG = 0x80000000
 
     kind = None
 
@@ -652,8 +661,8 @@ class ResultMessage(_MessageType):
     parsed_rows = None
     paging_state = None
     optimized_paging_id = None
-    optimized_page_sequence = None
-    is_last_optimized_page = None
+    optimized_paging_seq = None
+    optimized_paging_last = None
     new_keyspace = None
     column_metadata = None
     query_id = None
@@ -721,6 +730,11 @@ class ResultMessage(_MessageType):
         if no_meta:
             return
 
+        if flags & self._OPTIMIZED_PAGING_FLAG:
+            self.optimized_paging_id = UUID(bytes=f.read(16))
+            self.optimized_paging_seq = read_int(f)
+            self.optimized_paging_last = bool(read_byte(f))
+
         glob_tblspec = bool(flags & self._FLAGS_GLOBAL_TABLES_SPEC)
         if glob_tblspec:
             ksname = read_string(f)
@@ -738,10 +752,6 @@ class ResultMessage(_MessageType):
             column_metadata.append((colksname, colcfname, colname, coltype))
 
         self.column_metadata = column_metadata
-        if flags & self._OPTIMIZED_PAGING_FLAG:
-            self.optimized_paging_id = UUID(bytes=f.read(16))
-            self.optimized_page_sequence = read_int(f)
-            self.is_last_optimized_page = bool(read_byte(f))
 
     def recv_prepared_metadata(self, f, protocol_version, user_type_map):
         flags = read_int(f)
@@ -826,78 +836,6 @@ class PrepareMessage(_MessageType):
         write_longstring(f, self.query)
 
 
-class ExecuteMessage(_MessageType):
-    opcode = 0x0A
-    name = 'EXECUTE'
-
-    def __init__(self, query_id, query_params, consistency_level,
-                 serial_consistency_level=None, fetch_size=None,
-                 paging_state=None, timestamp=None, skip_meta=False,
-                 optimized_paging_options=None):
-        self.query_id = query_id
-        self.query_params = query_params
-        self.consistency_level = consistency_level
-        self.serial_consistency_level = serial_consistency_level
-        self.fetch_size = fetch_size
-        self.paging_state = paging_state
-        self.timestamp = timestamp
-        self.skip_meta = skip_meta
-        self.optimized_paging_options = optimized_paging_options
-
-    def send_body(self, f, protocol_version):
-        write_string(f, self.query_id)
-        if protocol_version == 1:
-            if self.serial_consistency_level:
-                raise UnsupportedOperation(
-                    "Serial consistency levels require the use of protocol version "
-                    "2 or higher. Consider setting Cluster.protocol_version to 2 "
-                    "to support serial consistency levels.")
-            if self.fetch_size or self.paging_state:
-                raise UnsupportedOperation(
-                    "Automatic query paging may only be used with protocol version "
-                    "2 or higher. Consider setting Cluster.protocol_version to 2.")
-            write_short(f, len(self.query_params))
-            for param in self.query_params:
-                write_value(f, param)
-            write_consistency_level(f, self.consistency_level)
-        else:
-            write_consistency_level(f, self.consistency_level)
-            flags = _VALUES_FLAG
-            if self.serial_consistency_level:
-                flags |= _WITH_SERIAL_CONSISTENCY_FLAG
-            if self.fetch_size:
-                flags |= _PAGE_SIZE_FLAG
-            if self.paging_state:
-                flags |= _WITH_PAGING_STATE_FLAG
-            if self.timestamp is not None:
-                if protocol_version >= 3:
-                    flags |= _PROTOCOL_TIMESTAMP_FLAG
-                else:
-                    raise UnsupportedOperation(
-                        "Protocol-level timestamps may only be used with protocol version "
-                        "3 or higher. Consider setting Cluster.protocol_version to 3.")
-            if self.skip_meta:
-                flags |= _SKIP_METADATA_FLAG
-
-            if protocol_version >= 5:
-                write_int(f, flags)
-            else:
-                write_byte(f, flags)
-
-            write_short(f, len(self.query_params))
-            for param in self.query_params:
-                write_value(f, param)
-            if self.fetch_size:
-                write_int(f, self.fetch_size)
-            if self.paging_state:
-                write_longstring(f, self.paging_state)
-            if self.serial_consistency_level:
-                write_consistency_level(f, self.serial_consistency_level)
-            if self.timestamp is not None:
-                write_long(f, self.timestamp)
-
-
-
 class BatchMessage(_MessageType):
     opcode = 0x0D
     name = 'BATCH'
@@ -934,7 +872,7 @@ class BatchMessage(_MessageType):
                 flags |= _PROTOCOL_TIMESTAMP
 
             if protocol_version >= 5:
-                write_int(f, flags)
+                write_uint(f, flags)
             else:
                 write_byte(f, flags)
 
@@ -1147,7 +1085,6 @@ class _ProtocolHandler(object):
         msg.stream_id = stream_id
         msg.trace_id = trace_id
         msg.custom_payload = custom_payload
-        msg.extract_dse_payloads()
         msg.warnings = warnings
 
         if msg.warnings:
@@ -1230,6 +1167,10 @@ def read_int(f):
 
 def write_int(f, i):
     f.write(int32_pack(i))
+
+
+def write_uint(f, i):
+    f.write(uint32_pack(i))
 
 
 def write_long(f, i):
@@ -1401,3 +1342,4 @@ def write_inet(f, addrtuple):
     write_byte(f, len(addrbytes))
     f.write(addrbytes)
     write_int(f, port)
+

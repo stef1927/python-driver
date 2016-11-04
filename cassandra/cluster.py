@@ -2159,7 +2159,6 @@ class Session(object):
         message.tracing = trace
         message.update_custom_payload(query.custom_payload)
         message.update_custom_payload(custom_payload)
-        message.inject_dse_payloads()
         message.allow_beta_protocol_version = self.cluster.allow_beta_protocol_version
 
         spec_exec_plan = spec_exec_policy.new_plan(query.keyspace or self.keyspace, query) if query.is_idempotent and spec_exec_policy else None
