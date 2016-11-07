@@ -197,12 +197,9 @@ class OptimizedPagingOptions(object):
 
     page_unit = None
     """
-    Value of PagingUnit. Default is PagingUnit.ROWS
-    """
+    Value of PagingUnit. Default is PagingUnit.ROWS.
 
-    page_size = None
-    """
-    Approximate size of pages, in `paging_unit`
+    Units refer to the :attr:`~.Statement.fetch_size` or :attr:`~.Session.default_fetch_size`.
     """
 
     max_pages = None
@@ -215,9 +212,8 @@ class OptimizedPagingOptions(object):
     Max rate at which to send pages
     """
 
-    def __init__(self, page_unit=PagingUnit.ROWS, page_size=5000, max_pages=0, max_pages_per_second=0):
+    def __init__(self, page_unit=PagingUnit.ROWS, max_pages=0, max_pages_per_second=0):
         self.page_unit = page_unit
-        self.page_size = page_size
         self.max_pages = max_pages
         self.max_pages_per_second = max_pages_per_second
 
@@ -3577,8 +3573,8 @@ class ResponseFuture(object):
                     self._col_types = response.column_types
                     self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
                 else:
-                    if response.kind == RESULT_KIND_VOID and self.message.optimized_paging_id is not None:
-                        self._optimized_paging_session = connection.new_optimized_paging_session(self.message.optimized_paging_id, self.row_factory)
+                    if response.kind == RESULT_KIND_VOID and self.message.optimized_paging_options:
+                        self._optimized_paging_session = connection.new_optimized_paging_session(response.stream_id, self._protocol_handler.decode_message, self.row_factory)
                         self._set_final_result(self._optimized_paging_session.results())
                     else:
                         self._set_final_result(response)
@@ -4111,6 +4107,7 @@ class ResultSet(object):
         try:
             self.response_future._optimized_paging_session.cancel()
         except AttributeError:
+            log.exception('asdflkajsdflkjasdf')
             raise DriverException("Attempted to cancel paging with no active session. This is only for requests with OptimizedPagingOptions.")
 
     @property

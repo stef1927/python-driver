@@ -171,8 +171,9 @@ class ProtocolError(Exception):
 
 
 class OptimizedPagingSession(object):
-    def __init__(self, paging_id, row_factory, connection):
-        self.paging_id = paging_id
+    def __init__(self, stream_id, decoder, row_factory, connection):
+        self.stream_id = stream_id
+        self.decoder = decoder
         self.row_factory = row_factory
         self.connection = connection
         self._condition = Condition()
@@ -185,11 +186,11 @@ class OptimizedPagingSession(object):
             self._stop |= result.optimized_paging_last
             self._condition.notify()
         if result.optimized_paging_last:
-            self.connection.remove_optimized_paging_session(self.paging_id)
+            self.connection.remove_optimized_paging_session(self.stream_id)
 
     def results(self):
         with self._condition:
-            while not self._stop:
+            while True:
                 while not self._page_queue and not self._stop:
                     # TODO: need to timeout here somehow
                     self._condition.wait()
@@ -199,10 +200,12 @@ class OptimizedPagingSession(object):
                     for row in self.row_factory(names, rows):
                         yield row
                     self._condition.acquire()
+                if self._stop:
+                    break
 
     def cancel(self):
-        log.debug("Canceling paging session %s from %s", self.paging_id, self.connection.host)
-        self.connection.send_msg(CancelMessage(OPTIMIZED_PAGING_OP_TYPE, self.paging_id),
+        log.debug("Canceling paging session %s from %s", self.stream_id, self.connection.host)
+        self.connection.send_msg(CancelMessage(OPTIMIZED_PAGING_OP_TYPE, self.stream_id),
                                  self.connection.get_request_id(),
                                  self._on_cancel_response)
         with self._condition:
@@ -211,11 +214,11 @@ class OptimizedPagingSession(object):
 
     def _on_cancel_response(self, response):
         if isinstance(response, ResultMessage):
-            log.debug("Paging session %s canceled.", self.paging_id)
+            log.debug("Paging session %s canceled.", self.stream_id)
         else:
-            log.error("Failed canceling streaming session %s from %s: %s", self.paging_id, self.connection.host,
+            log.error("Failed canceling streaming session %s from %s: %s", self.stream_id, self.connection.host,
                       response.to_exception() if hasattr(response, 'to_exception') else response)
-        self.connection.remove_optimized_paging_session(self.paging_id)
+        self.connection.remove_optimized_paging_session(self.stream_id)
 
 
 def defunct_on_error(f):
@@ -644,9 +647,13 @@ class Connection(object):
             decoder = ProtocolHandler.decode_message
             result_metadata = None
         else:
-            callback, decoder, result_metadata = self._requests.pop(stream_id)
-            with self.lock:
-                self.request_ids.append(stream_id)
+            if stream_id in self._requests:
+                callback, decoder, result_metadata = self._requests.pop(stream_id)
+            else:
+                paging_session = self._optimized_paging_sessions[stream_id]
+                callback = paging_session.on_page
+                decoder = paging_session.decoder
+                result_metadata = None
 
         self.msg_received = True
 
@@ -676,13 +683,23 @@ class Connection(object):
         except Exception:
             log.exception("Callback handler errored, ignoring:")
 
-    def new_optimized_paging_session(self, paging_id, row_factory):
-        session = OptimizedPagingSession(paging_id, row_factory, self)
-        self._optimized_paging_sessions[paging_id] = session
+        # done after callback because the callback might signal this as a paging session
+        if stream_id >= 0 and stream_id not in self._optimized_paging_sessions:
+            with self.lock:
+                self.request_ids.append(stream_id)
+
+    def new_optimized_paging_session(self, stream_id, decoder, row_factory):
+        session = OptimizedPagingSession(stream_id, decoder, row_factory, self)
+        self._optimized_paging_sessions[stream_id] = session
         return session
 
-    def remove_optimized_paging_session(self, paging_id):
-        self._optimized_paging_sessions.pop(paging_id)
+    def remove_optimized_paging_session(self, stream_id):
+        try:
+            self._optimized_paging_sessions.pop(stream_id)
+            with self.lock:
+                self.request_ids.append(stream_id)
+        except KeyError:
+            pass
 
     @defunct_on_error
     def _send_options_message(self):

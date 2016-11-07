@@ -589,12 +589,9 @@ class _QueryMessage(_MessageType):
         if self.timestamp is not None:
             write_long(f, self.timestamp)
         if self.optimized_paging_options:
-            self.optimized_paging_id = uuid1()
-            self._write_paging_options(f, self.optimized_paging_id, self.optimized_paging_options)
+            self._write_paging_options(f, self.optimized_paging_options)
 
-    def _write_paging_options(self, f, id, paging_options):
-        f.write(id.bytes)
-        write_int(f, paging_options.page_size)
+    def _write_paging_options(self, f, paging_options):
         write_int(f, paging_options.page_unit)
         write_int(f, paging_options.max_pages)
         write_int(f, paging_options.max_pages_per_second)
@@ -660,7 +657,6 @@ class ResultMessage(_MessageType):
     column_types = None
     parsed_rows = None
     paging_state = None
-    optimized_paging_id = None
     optimized_paging_seq = None
     optimized_paging_last = None
     new_keyspace = None
@@ -731,7 +727,6 @@ class ResultMessage(_MessageType):
             return
 
         if flags & self._OPTIMIZED_PAGING_FLAG:
-            self.optimized_paging_id = UUID(bytes=f.read(16))
             self.optimized_paging_seq = read_int(f)
             self.optimized_paging_last = bool(read_byte(f))
 
@@ -969,7 +964,7 @@ class CancelMessage(_MessageType):
 
     def send_body(self, f, protocol_version):
         write_int(f, self.op_type)
-        f.write(self.op_id.bytes)
+        write_int(f, self.op_id)
 
 
 class _ProtocolHandler(object):
