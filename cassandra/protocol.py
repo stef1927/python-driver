@@ -385,6 +385,11 @@ class AlreadyExistsException(ConfigurationException):
         return AlreadyExists(**self.info)
 
 
+class ClientWriteError(RequestExecutionException):
+    summary = 'Client write failure.'
+    error_code = 0x8000
+
+
 class StartupMessage(_MessageType):
     opcode = 0x01
     name = 'STARTUP'
