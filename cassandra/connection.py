@@ -495,13 +495,7 @@ class Connection(object):
             return self.highest_request_id
 
     def handle_pushed(self, response):
-        if isinstance(response, ResultMessage):
-            paging_session = self._optimized_paging_sessions.get(response.optimized_paging_id)
-            if paging_session:
-                paging_session.on_page(response)
-            else:
-                log.warn("Received optimized paging message for unregistered id: %s", response.optimized_paging_id)
-        elif isinstance(response, EventMessage):
+        if isinstance(response, EventMessage):
             log.debug("EventMessage pushed from server: %r", response)
             for cb in self._push_watchers.get(response.event_type, []):
                 try:
@@ -649,7 +643,7 @@ class Connection(object):
         else:
             if stream_id in self._requests:
                 callback, decoder, result_metadata = self._requests.pop(stream_id)
-            else:
+            elif stream_id in self._optimized_paging_sessions:
                 paging_session = self._optimized_paging_sessions[stream_id]
                 callback = paging_session.on_page
                 decoder = paging_session.decoder
