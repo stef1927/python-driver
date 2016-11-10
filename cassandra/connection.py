@@ -180,13 +180,28 @@ class OptimizedPagingSession(object):
         self._stop = False
         self._page_queue = []
 
+    def on_message(self, result):
+        if isinstance(result, ResultMessage):
+            self.on_page(result)
+        elif isinstance(result, ErrorMessage):
+            self.on_error(result)
+
     def on_page(self, result):
         with self._condition:
-            heappush(self._page_queue, (result.column_names, result.parsed_rows))
+            heappush(self._page_queue, (result.column_names, result.parsed_rows, None))
             self._stop |= result.optimized_paging_last
             self._condition.notify()
+
         if result.optimized_paging_last:
             self.connection.remove_optimized_paging_session(self.stream_id)
+
+    def on_error(self, error):
+        with self._condition:
+            heappush(self._page_queue, (None, None, error.to_exception()))
+            self._stop = True
+            self._condition.notify()
+
+        self.connection.remove_optimized_paging_session(self.stream_id)
 
     def results(self):
         with self._condition:
@@ -195,7 +210,9 @@ class OptimizedPagingSession(object):
                     # TODO: need to timeout here somehow
                     self._condition.wait()
                 while self._page_queue:
-                    names, rows = heappop(self._page_queue)
+                    names, rows, err = heappop(self._page_queue)
+                    if err:
+                        raise err
                     self._condition.release()
                     for row in self.row_factory(names, rows):
                         yield row
@@ -645,7 +662,7 @@ class Connection(object):
                 callback, decoder, result_metadata = self._requests.pop(stream_id)
             elif stream_id in self._optimized_paging_sessions:
                 paging_session = self._optimized_paging_sessions[stream_id]
-                callback = paging_session.on_page
+                callback = paging_session.on_message
                 decoder = paging_session.decoder
                 result_metadata = None
 
