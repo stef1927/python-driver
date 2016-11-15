@@ -178,7 +178,7 @@ class OptimizedPagingSession(object):
         self.connection = connection
         self._condition = Condition()
         self._stop = False
-        self._page_queue = []
+        self._page_queue = deque()
 
     def on_message(self, result):
         if isinstance(result, ResultMessage):
@@ -188,7 +188,7 @@ class OptimizedPagingSession(object):
 
     def on_page(self, result):
         with self._condition:
-            heappush(self._page_queue, (result.column_names, result.parsed_rows, None))
+            self._page_queue.appendleft((result.column_names, result.parsed_rows, None))
             self._stop |= result.optimized_paging_last
             self._condition.notify()
 
@@ -197,7 +197,7 @@ class OptimizedPagingSession(object):
 
     def on_error(self, error):
         with self._condition:
-            heappush(self._page_queue, (None, None, error.to_exception()))
+            self._page_queue.appendleft((None, None, error.to_exception()))
             self._stop = True
             self._condition.notify()
 
@@ -210,7 +210,7 @@ class OptimizedPagingSession(object):
                     # TODO: need to timeout here somehow
                     self._condition.wait()
                 while self._page_queue:
-                    names, rows, err = heappop(self._page_queue)
+                    names, rows, err = self._page_queue.pop()
                     if err:
                         raise err
                     self._condition.release()
