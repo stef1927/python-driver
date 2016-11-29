@@ -46,7 +46,7 @@ from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessag
                                 AuthResponseMessage, AuthChallengeMessage,
                                 AuthSuccessMessage, ProtocolException,
                                 MAX_SUPPORTED_VERSION, RegisterMessage,
-                                OPTIMIZED_PAGING_OP_TYPE, CancelMessage, EventMessage)
+                                CONTINUOUS_PAGING_OP_TYPE, CancelMessage, EventMessage)
 from cassandra.util import OrderedDict
 
 
@@ -170,7 +170,7 @@ class ProtocolError(Exception):
     pass
 
 
-class OptimizedPagingSession(object):
+class ContinuousPagingSession(object):
     def __init__(self, stream_id, decoder, row_factory, connection):
         self.stream_id = stream_id
         self.decoder = decoder
@@ -189,11 +189,11 @@ class OptimizedPagingSession(object):
     def on_page(self, result):
         with self._condition:
             self._page_queue.appendleft((result.column_names, result.parsed_rows, None))
-            self._stop |= result.optimized_paging_last
+            self._stop |= result.continuous_paging_last
             self._condition.notify()
 
-        if result.optimized_paging_last:
-            self.connection.remove_optimized_paging_session(self.stream_id)
+        if result.continuous_paging_last:
+            self.connection.remove_continuous_paging_session(self.stream_id)
 
     def on_error(self, error):
         with self._condition:
@@ -201,7 +201,7 @@ class OptimizedPagingSession(object):
             self._stop = True
             self._condition.notify()
 
-        self.connection.remove_optimized_paging_session(self.stream_id)
+        self.connection.remove_continuous_paging_session(self.stream_id)
 
     def results(self):
         with self._condition:
@@ -222,7 +222,7 @@ class OptimizedPagingSession(object):
 
     def cancel(self):
         log.debug("Canceling paging session %s from %s", self.stream_id, self.connection.host)
-        self.connection.send_msg(CancelMessage(OPTIMIZED_PAGING_OP_TYPE, self.stream_id),
+        self.connection.send_msg(CancelMessage(CONTINUOUS_PAGING_OP_TYPE, self.stream_id),
                                  self.connection.get_request_id(),
                                  self._on_cancel_response)
         with self._condition:
@@ -235,7 +235,7 @@ class OptimizedPagingSession(object):
         else:
             log.error("Failed canceling streaming session %s from %s: %s", self.stream_id, self.connection.host,
                       response.to_exception() if hasattr(response, 'to_exception') else response)
-        self.connection.remove_optimized_paging_session(self.stream_id)
+        self.connection.remove_continuous_paging_session(self.stream_id)
 
 
 def defunct_on_error(f):
@@ -338,7 +338,7 @@ class Connection(object):
         self._push_watchers = defaultdict(set)
         self._requests = {}
         self._iobuf = io.BytesIO()
-        self._optimized_paging_sessions = {}
+        self._continuous_paging_sessions = {}
 
         if ssl_options:
             self._check_hostname = bool(self.ssl_options.pop('check_hostname', False))
@@ -660,8 +660,8 @@ class Connection(object):
         else:
             if stream_id in self._requests:
                 callback, decoder, result_metadata = self._requests.pop(stream_id)
-            elif stream_id in self._optimized_paging_sessions:
-                paging_session = self._optimized_paging_sessions[stream_id]
+            elif stream_id in self._continuous_paging_sessions:
+                paging_session = self._continuous_paging_sessions[stream_id]
                 callback = paging_session.on_message
                 decoder = paging_session.decoder
                 result_metadata = None
@@ -695,18 +695,18 @@ class Connection(object):
             log.exception("Callback handler errored, ignoring:")
 
         # done after callback because the callback might signal this as a paging session
-        if stream_id >= 0 and stream_id not in self._optimized_paging_sessions:
+        if stream_id >= 0 and stream_id not in self._continuous_paging_sessions:
             with self.lock:
                 self.request_ids.append(stream_id)
 
-    def new_optimized_paging_session(self, stream_id, decoder, row_factory):
-        session = OptimizedPagingSession(stream_id, decoder, row_factory, self)
-        self._optimized_paging_sessions[stream_id] = session
+    def new_continuous_paging_session(self, stream_id, decoder, row_factory):
+        session = ContinuousPagingSession(stream_id, decoder, row_factory, self)
+        self._continuous_paging_sessions[stream_id] = session
         return session
 
-    def remove_optimized_paging_session(self, stream_id):
+    def remove_continuous_paging_session(self, stream_id):
         try:
-            self._optimized_paging_sessions.pop(stream_id)
+            self._continuous_paging_sessions.pop(stream_id)
             with self.lock:
                 self.request_ids.append(stream_id)
         except KeyError:

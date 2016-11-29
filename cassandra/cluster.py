@@ -189,7 +189,7 @@ def default_lbp_factory():
     return DCAwareRoundRobinPolicy()
 
 
-class OptimizedPagingOptions(object):
+class ContinuousPagingOptions(object):
 
     class PagingUnit(object):
         BYTES = 1
@@ -216,6 +216,9 @@ class OptimizedPagingOptions(object):
         self.page_unit = page_unit
         self.max_pages = max_pages
         self.max_pages_per_second = max_pages_per_second
+
+    def page_unit_bytes(self):
+        return self.page_unit == ContinuousPagingOptions.PagingUnit.BYTES
 
 
 class ExecutionProfile(object):
@@ -271,9 +274,9 @@ class ExecutionProfile(object):
     Defaults to :class:`.NoSpeculativeExecutionPolicy` if not specified
     """
 
-    optimized_paging_options = None
+    continuous_paging_options = None
     """
-    When set, requests will use Apollo's optimized paging, which streams multiple pages without
+    When set, requests will use Apollo's continuous paging, which streams multiple pages without
     intermediate requests.
 
     This has the potential to materialize all results in memory at once if the consumer cannot keep up. Use options
@@ -283,7 +286,7 @@ class ExecutionProfile(object):
     def __init__(self, load_balancing_policy=None, retry_policy=None,
                  consistency_level=ConsistencyLevel.LOCAL_ONE, serial_consistency_level=None,
                  request_timeout=10.0, row_factory=named_tuple_factory, speculative_execution_policy=None,
-                 optimized_paging_options=None):
+                 continuous_paging_options=None):
         self.load_balancing_policy = load_balancing_policy or default_lbp_factory()
         self.retry_policy = retry_policy or RetryPolicy()
         self.consistency_level = consistency_level
@@ -291,7 +294,7 @@ class ExecutionProfile(object):
         self.request_timeout = request_timeout
         self.row_factory = row_factory
         self.speculative_execution_policy = speculative_execution_policy or NoSpeculativeExecutionPolicy()
-        self.optimized_paging_options = optimized_paging_options
+        self.continuous_paging_options = continuous_paging_options
 
 
 class ProfileManager(object):
@@ -2102,7 +2105,7 @@ class Session(object):
             row_factory = self.row_factory
             load_balancing_policy = self.cluster.load_balancing_policy
             spec_exec_policy = None
-            optimized_paging_options = None
+            continuous_paging_options = None
         else:
             execution_profile = self._get_execution_profile(execution_profile)
 
@@ -2116,7 +2119,7 @@ class Session(object):
             row_factory = execution_profile.row_factory
             load_balancing_policy = execution_profile.load_balancing_policy
             spec_exec_policy = execution_profile.speculative_execution_policy
-            optimized_paging_options = execution_profile.optimized_paging_options
+            continuous_paging_options = execution_profile.continuous_paging_options
 
         fetch_size = query.fetch_size
         if fetch_size is FETCH_SIZE_UNSET and self._protocol_version >= 2:
@@ -2135,13 +2138,13 @@ class Session(object):
             if parameters:
                 query_string = bind_params(query_string, parameters, self.encoder)
             message = QueryMessage(
-                query_string, cl, serial_cl, fetch_size, paging_state, timestamp, optimized_paging_options)
+                query_string, cl, serial_cl, fetch_size, paging_state, timestamp, continuous_paging_options)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
-                skip_meta=bool(prepared_statement.result_metadata), optimized_paging_options=optimized_paging_options)
+                skip_meta=bool(prepared_statement.result_metadata), continuous_paging_options=continuous_paging_options)
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -3318,7 +3321,7 @@ class ResponseFuture(object):
     _timer = None
     _protocol_handler = ProtocolHandler
     _spec_execution_plan = NoSpeculativeExecutionPlan()
-    _optimized_paging_session = None
+    _continuous_paging_options = None
 
     _warned_timeout = False
 
@@ -3573,9 +3576,9 @@ class ResponseFuture(object):
                     self._col_types = response.column_types
                     self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
                 else:
-                    if response.kind == RESULT_KIND_VOID and self.message.optimized_paging_options:
-                        self._optimized_paging_session = connection.new_optimized_paging_session(response.stream_id, self._protocol_handler.decode_message, self.row_factory)
-                        self._set_final_result(self._optimized_paging_session.results())
+                    if response.kind == RESULT_KIND_VOID and self.message.continuous_paging_options:
+                        self._continuous_paging_session = connection.new_continuous_paging_session(response.stream_id, self._protocol_handler.decode_message, self.row_factory)
+                        self._set_final_result(self._continuous_paging_session.results())
                     else:
                         self._set_final_result(response)
             elif isinstance(response, ErrorMessage):
@@ -4103,12 +4106,12 @@ class ResultSet(object):
         """
         return self.response_future.get_all_query_traces(max_wait_sec_per)
 
-    def cancel_optimized_paging(self):
+    def cancel_continuous_paging(self):
         try:
-            self.response_future._optimized_paging_session.cancel()
+            self.response_future._continuous_paging_session.cancel()
         except AttributeError:
             log.exception('asdflkajsdflkjasdf')
-            raise DriverException("Attempted to cancel paging with no active session. This is only for requests with OptimizedPagingOptions.")
+            raise DriverException("Attempted to cancel paging with no active session. This is only for requests with ContinuousdPagingOptions.")
 
     @property
     def was_applied(self):

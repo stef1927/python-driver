@@ -86,7 +86,6 @@ class _RegisterMessageType(type):
         if not name.startswith('_'):
             register_class(cls)
 
-CORE_OPTIMIZED_PAGING = 'core.optimized.paging'
 
 @six.add_metaclass(_RegisterMessageType)
 class _MessageType(object):
@@ -511,20 +510,22 @@ class SupportedMessage(_MessageType):
 # used for QueryMessage and ExecuteMessage
 _VALUES_FLAG = 0x01
 _SKIP_METADATA_FLAG = 0x02
-_PAGE_SIZE_FLAG = 0x04
+_PAGE_SIZE_ROWS_FLAG = 0x04
 _WITH_PAGING_STATE_FLAG = 0x08
 _WITH_SERIAL_CONSISTENCY_FLAG = 0x10
 _PROTOCOL_TIMESTAMP_FLAG = 0x20
 _NAMES_FOR_VALUES_FLAG = 0x40  # not used here
 
+_PAGE_SIZE_BYTES_FLAG = 0x40000000
 _PAGING_OPTIONS_FLAG = 0x80000000
+
 
 class _QueryMessage(_MessageType):
 
     def __init__(self, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
                  paging_state=None, timestamp=None, skip_meta=False,
-                 optimized_paging_options=None):
+                 continuous_paging_options=None):
         self.query_params = query_params
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
@@ -532,7 +533,7 @@ class _QueryMessage(_MessageType):
         self.paging_state = paging_state
         self.timestamp = timestamp
         self.skip_meta = skip_meta
-        self.optimized_paging_options = optimized_paging_options
+        self.continuous_paging_options = continuous_paging_options
 
     def _write_query_params(self, f, protocol_version):
         write_consistency_level(f, self.consistency_level)
@@ -551,7 +552,11 @@ class _QueryMessage(_MessageType):
 
         if self.fetch_size:
             if protocol_version >= 2:
-                flags |= _PAGE_SIZE_FLAG
+                if self.continuous_paging_options and protocol_version >= 65 \
+                 and self.continuous_paging_options.page_unit_bytes():
+                    flags |= _PAGE_SIZE_BYTES_FLAG
+                else:
+                    flags |= _PAGE_SIZE_ROWS_FLAG
             else:
                 raise UnsupportedOperation(
                     "Automatic query paging may only be used with protocol version "
@@ -568,13 +573,13 @@ class _QueryMessage(_MessageType):
         if self.timestamp is not None:
             flags |= _PROTOCOL_TIMESTAMP_FLAG
 
-        if self.optimized_paging_options:
-            if protocol_version >= 5:
+        if self.continuous_paging_options:
+            if protocol_version >= 65:
                 flags |= _PAGING_OPTIONS_FLAG
             else:
                 raise UnsupportedOperation(
-                    "Optimized paging may only be used with protocol version "
-                    "5 or higher. Consider setting Cluster.protocol_version to 5.")
+                    "Continuous paging may only be used with protocol version "
+                    "65 or higher. Consider setting Cluster.protocol_version to 65.")
 
         if protocol_version >= 5:
             write_uint(f, flags)
@@ -593,11 +598,10 @@ class _QueryMessage(_MessageType):
             write_consistency_level(f, self.serial_consistency_level)
         if self.timestamp is not None:
             write_long(f, self.timestamp)
-        if self.optimized_paging_options:
-            self._write_paging_options(f, self.optimized_paging_options)
+        if self.continuous_paging_options:
+            self._write_paging_options(f, self.continuous_paging_options)
 
     def _write_paging_options(self, f, paging_options):
-        write_int(f, paging_options.page_unit)
         write_int(f, paging_options.max_pages)
         write_int(f, paging_options.max_pages_per_second)
 
@@ -607,10 +611,10 @@ class QueryMessage(_QueryMessage):
     name = 'QUERY'
 
     def __init__(self, query, consistency_level, serial_consistency_level=None,
-                 fetch_size=None, paging_state=None, timestamp=None, optimized_paging_options=None):
+                 fetch_size=None, paging_state=None, timestamp=None, continuous_paging_options=None):
         self.query = query
         super(QueryMessage, self).__init__(None, consistency_level, serial_consistency_level, fetch_size,
-                                           paging_state, timestamp, False, optimized_paging_options)
+                                           paging_state, timestamp, False, continuous_paging_options)
 
     def send_body(self, f, protocol_version):
         write_longstring(f, self.query)
@@ -624,10 +628,10 @@ class ExecuteMessage(_QueryMessage):
     def __init__(self, query_id, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
                  paging_state=None, timestamp=None, skip_meta=False,
-                 optimized_paging_options=None):
+                 continuous_paging_options=None):
         self.query_id = query_id
         super(ExecuteMessage, self).__init__(query_params, consistency_level, serial_consistency_level, fetch_size,
-                                             paging_state, timestamp, skip_meta, optimized_paging_options)
+                                             paging_state, timestamp, skip_meta, continuous_paging_options)
 
     def send_body(self, f, protocol_version):
         write_string(f, self.query_id)
@@ -653,7 +657,8 @@ class ResultMessage(_MessageType):
     _FLAGS_GLOBAL_TABLES_SPEC = 0x0001
     _HAS_MORE_PAGES_FLAG = 0x0002
     _NO_METADATA_FLAG = 0x0004
-    _OPTIMIZED_PAGING_FLAG = 0x80000000
+    _CONTINUOUS_PAGING_FLAG = 0x40000000
+    _CONTINUOUS_PAGING_LAST_FLAG = 0x80000000
 
     kind = None
 
@@ -662,8 +667,8 @@ class ResultMessage(_MessageType):
     column_types = None
     parsed_rows = None
     paging_state = None
-    optimized_paging_seq = None
-    optimized_paging_last = None
+    continuous_paging_seq = None
+    continuous_paging_last = None
     new_keyspace = None
     column_metadata = None
     query_id = None
@@ -731,9 +736,9 @@ class ResultMessage(_MessageType):
         if no_meta:
             return
 
-        if flags & self._OPTIMIZED_PAGING_FLAG:
-            self.optimized_paging_seq = read_int(f)
-            self.optimized_paging_last = bool(read_byte(f))
+        if flags & self._CONTINUOUS_PAGING_FLAG:
+            self.continuous_paging_seq = read_int(f)
+            self.continuous_paging_last = flags & self._CONTINUOUS_PAGING_LAST_FLAG
 
         glob_tblspec = bool(flags & self._FLAGS_GLOBAL_TABLES_SPEC)
         if glob_tblspec:
@@ -956,7 +961,8 @@ class EventMessage(_MessageType):
         return event
 
 
-OPTIMIZED_PAGING_OP_TYPE = 1
+CONTINUOUS_PAGING_OP_TYPE = 1
+
 
 # TODO: DSE message type
 class CancelMessage(_MessageType):
