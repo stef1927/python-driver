@@ -3574,13 +3574,16 @@ class ResponseFuture(object):
                     self._paging_state = response.paging_state
                     self._col_names = response.column_names
                     self._col_types = response.column_types
-                    self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
-                else:
-                    if response.kind == RESULT_KIND_VOID and self.message.continuous_paging_options:
-                        self._continuous_paging_session = connection.new_continuous_paging_session(response.stream_id, self._protocol_handler.decode_message, self.row_factory)
+                    if self.message.continuous_paging_options:
+                        self._continuous_paging_session = connection.new_continuous_paging_session(response.stream_id,
+                                                                                                   self._protocol_handler.decode_message,
+                                                                                                   self.row_factory)
                         self._set_final_result(self._continuous_paging_session.results())
+                        self._continuous_paging_session.on_message(response)
                     else:
-                        self._set_final_result(response)
+                        self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
+                else:
+                    self._set_final_result(response)
             elif isinstance(response, ErrorMessage):
                 retry_policy = self._retry_policy
 

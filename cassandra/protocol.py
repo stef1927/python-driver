@@ -510,7 +510,7 @@ class SupportedMessage(_MessageType):
 # used for QueryMessage and ExecuteMessage
 _VALUES_FLAG = 0x01
 _SKIP_METADATA_FLAG = 0x02
-_PAGE_SIZE_ROWS_FLAG = 0x04
+_PAGE_SIZE_FLAG = 0x04
 _WITH_PAGING_STATE_FLAG = 0x08
 _WITH_SERIAL_CONSISTENCY_FLAG = 0x10
 _PROTOCOL_TIMESTAMP_FLAG = 0x20
@@ -552,11 +552,9 @@ class _QueryMessage(_MessageType):
 
         if self.fetch_size:
             if protocol_version >= 2:
-                if self.continuous_paging_options and protocol_version >= 65 \
-                 and self.continuous_paging_options.page_unit_bytes():
+                flags |= _PAGE_SIZE_FLAG
+                if self.continuous_paging_options and self.continuous_paging_options.page_unit_bytes():
                     flags |= _PAGE_SIZE_BYTES_FLAG
-                else:
-                    flags |= _PAGE_SIZE_ROWS_FLAG
             else:
                 raise UnsupportedOperation(
                     "Automatic query paging may only be used with protocol version "
