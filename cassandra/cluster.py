@@ -3575,11 +3575,7 @@ class ResponseFuture(object):
                     self._col_names = response.column_names
                     self._col_types = response.column_types
                     if self.message.continuous_paging_options:
-                        self._continuous_paging_session = connection.new_continuous_paging_session(response.stream_id,
-                                                                                                   self._protocol_handler.decode_message,
-                                                                                                   self.row_factory)
-                        self._set_final_result(self._continuous_paging_session.results())
-                        self._continuous_paging_session.on_message(response)
+                        self._handle_continuous_paging_first_response(connection, response)
                     else:
                         self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
                 else:
@@ -3694,6 +3690,13 @@ class ResponseFuture(object):
             # almost certainly caused by a bug, but we need to set something here
             log.exception("Unexpected exception while handling result in ResponseFuture:")
             self._set_final_exception(exc)
+
+    def _handle_continuous_paging_first_response(self, connection, response):
+        self._continuous_paging_session = connection.new_continuous_paging_session(response.stream_id,
+                                                                                   self._protocol_handler.decode_message,
+                                                                                   self.row_factory)
+        self._set_final_result(self._continuous_paging_session.results())
+        self._continuous_paging_session.on_message(response)
 
     def _set_keyspace_completed(self, errors):
         if not errors:
@@ -4038,8 +4041,9 @@ class ResultSet(object):
                     self._current_rows = []
                 raise
 
-        self.fetch_next_page()
-        self._page_iter = iter(self._current_rows)
+        if not hasattr(self.response_future, '_continuous_paging_session'):
+            self.fetch_next_page()
+            self._page_iter = iter(self._current_rows)
 
         return next(self._page_iter)
 
