@@ -512,15 +512,12 @@ class Connection(object):
             return self.highest_request_id
 
     def handle_pushed(self, response):
-        if isinstance(response, EventMessage):
-            log.debug("EventMessage pushed from server: %r", response)
-            for cb in self._push_watchers.get(response.event_type, []):
-                try:
-                    cb(response.event_args)
-                except Exception:
-                    log.exception("Pushed event handler errored, ignoring:")
-        else:
-            log.debug("Unexpected message pushed from server: %r", response)
+        log.debug("Message pushed from server: %r", response)
+        for cb in self._push_watchers.get(response.event_type, []):
+            try:
+                cb(response.event_args)
+            except Exception:
+                log.exception("Pushed event handler errored, ignoring:")
 
     def send_msg(self, msg, request_id, cb, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=None):
         if self.is_defunct:
@@ -658,13 +655,13 @@ class Connection(object):
             decoder = ProtocolHandler.decode_message
             result_metadata = None
         else:
-            if stream_id in self._requests:
-                callback, decoder, result_metadata = self._requests.pop(stream_id)
-            elif stream_id in self._continuous_paging_sessions:
+            if stream_id in self._continuous_paging_sessions:
                 paging_session = self._continuous_paging_sessions[stream_id]
                 callback = paging_session.on_message
                 decoder = paging_session.decoder
                 result_metadata = None
+            else:
+                callback, decoder, result_metadata = self._requests.pop(stream_id)
 
         self.msg_received = True
 
