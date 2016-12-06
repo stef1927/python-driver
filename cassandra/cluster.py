@@ -31,7 +31,7 @@ from six.moves import filter, range, queue as Queue
 import socket
 import sys
 import time
-from threading import Lock, RLock, Thread, Event, Condition
+from threading import Lock, RLock, Thread, Event
 
 import weakref
 from weakref import WeakValueDictionary
@@ -3578,6 +3578,8 @@ class ResponseFuture(object):
                         self._handle_continuous_paging_first_response(connection, response)
                     else:
                         self._set_final_result(self.row_factory(response.column_names, response.parsed_rows))
+                elif response.kind == RESULT_KIND_VOID:
+                    self._set_final_result(None)
                 else:
                     self._set_final_result(response)
             elif isinstance(response, ErrorMessage):
@@ -3719,7 +3721,8 @@ class ResponseFuture(object):
         if isinstance(response, ResultMessage):
             if response.kind == RESULT_KIND_PREPARED:
                 # result metadata is the only thing that could have changed from an alter
-                self.prepared_statement.result_metadata = response.result_metadata
+                if self.prepared_statement:
+                    self.prepared_statement.result_metadata = response.bind_metadata
 
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection

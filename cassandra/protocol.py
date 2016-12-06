@@ -16,7 +16,7 @@ from __future__ import absolute_import  # to enable import io from stdlib
 from collections import namedtuple
 import logging
 import socket
-from uuid import UUID, uuid1
+from uuid import UUID
 
 import six
 from six.moves import range
@@ -873,7 +873,7 @@ class BatchMessage(_MessageType):
             if self.serial_consistency_level:
                 flags |= _WITH_SERIAL_CONSISTENCY_FLAG
             if self.timestamp is not None:
-                flags |= _PROTOCOL_TIMESTAMP
+                flags |= _PROTOCOL_TIMESTAMP_FLAG
 
             if protocol_version >= 5:
                 write_uint(f, flags)
